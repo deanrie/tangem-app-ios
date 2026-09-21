@@ -71,7 +71,7 @@ extension WalletConnectSolanaSignMessageHandler: WalletConnectMessageHandler {
         // Refuse to "sign a message" that is actually a Solana transaction: it would be signed with the same
         // primitive as `solana_signTransaction` but without the transaction summary and Blockaid simulation.
         guard !SolanaSignMessagePayloadValidator.looksLikeTransaction(messageData) else {
-            WCLogger.error("Rejected solana_signMessage payload that decodes as a transaction")
+            WCLogger.info("Rejected solana_signMessage payload that decodes as a transaction")
             return .error(.invalidParams)
         }
 
