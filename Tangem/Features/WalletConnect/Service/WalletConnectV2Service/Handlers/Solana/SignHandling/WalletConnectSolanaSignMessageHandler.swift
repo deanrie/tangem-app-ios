@@ -10,6 +10,7 @@ import JSONRPC
 import TangemLocalization
 import Foundation
 import Commons
+import BlockchainSdk
 
 struct WalletConnectSolanaSignMessageHandler {
     private let message: String
@@ -65,8 +66,17 @@ extension WalletConnectSolanaSignMessageHandler: WalletConnectMessageHandler {
     }
 
     func handle() async throws -> RPCResult {
+        let messageData = message.base58DecodedData
+
+        // Refuse to "sign a message" that is actually a Solana transaction: it would be signed with the same
+        // primitive as `solana_signTransaction` but without the transaction summary and Blockaid simulation.
+        guard !SolanaSignMessagePayloadValidator.looksLikeTransaction(messageData) else {
+            WCLogger.error("Rejected solana_signMessage payload that decodes as a transaction")
+            return .error(.invalidParams)
+        }
+
         do {
-            let signature = try await signer.sign(data: message.base58DecodedData, using: walletModel)
+            let signature = try await signer.sign(data: messageData, using: walletModel)
             return .response(
                 AnyCodable(WalletConnectSolanaSignMessageDTO.Body(signature: signature.base58EncodedString))
             )
