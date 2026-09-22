@@ -11,6 +11,7 @@ import Combine
 import BlockchainSdk
 import TangemExpress
 import TangemFoundation
+import TangemLocalization
 import TangemMacro
 
 final class ApproveInteractor {
@@ -18,6 +19,18 @@ final class ApproveInteractor {
 
     var approveFeePublisher: AnyPublisher<TokenFee, Never> {
         tokenFeeProvidersManager.selectedTokenFeePublisher
+    }
+
+    /// `true` while the calldata is being rebuilt for a newly selected policy. The approve button must
+    /// stay disabled during this window, otherwise the previous policy's calldata would be signed.
+    var isRecalculatingPolicyPublisher: AnyPublisher<Bool, Never> {
+        isRecalculatingPolicySubject.eraseToAnyPublisher()
+    }
+
+    /// Emits the policy the calldata is still consistent with when a recalculation fails, so the UI
+    /// can revert its selection instead of showing a policy that is not what would be signed.
+    var policyRecalculationFailedPublisher: AnyPublisher<BSDKApprovePolicy, Never> {
+        policyRecalculationFailedSubject.eraseToAnyPublisher()
     }
 
     // MARK: - Dependencies
@@ -33,7 +46,12 @@ final class ApproveInteractor {
 
     private(set) var approveInteractorState: ApproveInteractorState
     private var currentPolicy: BSDKApprovePolicy
+    /// The policy `approveInteractorState` was built for. Diverges from `currentPolicy` only while a
+    /// recalculation is in flight; `sendApproveTransaction` refuses to sign when they differ.
+    private var statePolicy: BSDKApprovePolicy
     private var recalculateApproveFeeTask: Task<Void, Never>?
+    private let isRecalculatingPolicySubject = CurrentValueSubject<Bool, Never>(false)
+    private let policyRecalculationFailedSubject = PassthroughSubject<BSDKApprovePolicy, Never>()
 
     // MARK: - Init
 
@@ -49,6 +67,7 @@ final class ApproveInteractor {
     ) {
         self.approveInteractorState = approveInteractorState
         currentPolicy = initialPolicy
+        statePolicy = initialPolicy
         self.approveAmount = approveAmount
         self.allowanceService = allowanceService
         self.approveTransactionDispatcher = approveTransactionDispatcher
@@ -74,6 +93,8 @@ final class ApproveInteractor {
         currentPolicy = policy
 
         recalculateApproveFeeTask?.cancel()
+        isRecalculatingPolicySubject.send(true)
+
         recalculateApproveFeeTask = runTask(in: self) { interactor in
             do {
                 let allowanceResult = try await interactor.allowanceService.allowanceState(
@@ -85,24 +106,38 @@ final class ApproveInteractor {
                 try Task.checkCancellation()
 
                 guard let newState = interactor.makeApproveInteractorState(from: allowanceResult) else {
+                    // Allowance is already sufficient (or in progress): the sheet has nothing to sign for
+                    // this policy. Treat it like a failure so the UI reverts rather than signing stale data.
+                    await runOnMain {
+                        interactor.handlePolicyRecalculationFailure(error: nil)
+                    }
                     return
                 }
 
                 await runOnMain {
                     interactor.approveInteractorState = newState
+                    interactor.statePolicy = policy
+                    interactor.isRecalculatingPolicySubject.send(false)
                 }
 
                 interactor.tokenFeeProvidersManager.update(input: newState.feeInput)
                 interactor.tokenFeeProvidersManager.updateFees()
             } catch is CancellationError {
-                // Expected: superseded by a newer recalculation
+                // Expected: superseded by a newer recalculation, which now owns the "recalculating" flag.
             } catch {
-                ExpressLogger.error(error: error)
+                await runOnMain {
+                    interactor.handlePolicyRecalculationFailure(error: error)
+                }
             }
         }
     }
 
     func sendApproveTransaction() async throws {
+        // Never sign calldata that was built for a different policy than the one the user sees.
+        guard !isRecalculatingPolicySubject.value, currentPolicy == statePolicy else {
+            throw ApproveInteractorError.policyOutOfSync
+        }
+
         switch approveInteractorState {
         case .approve(let data):
             try await sendApprove(data: data)
@@ -120,6 +155,19 @@ final class ApproveInteractor {
 // MARK: - Private
 
 private extension ApproveInteractor {
+    /// A recalculation could not produce calldata for the newly selected policy. Keep the previous
+    /// (consistent) state, point `currentPolicy` back at it and tell the UI to revert its selection.
+    /// Call on the main queue (see `runOnMain` at the call sites).
+    func handlePolicyRecalculationFailure(error: Error?) {
+        if let error {
+            ExpressLogger.error(error: error)
+        }
+
+        currentPolicy = statePolicy
+        isRecalculatingPolicySubject.send(false)
+        policyRecalculationFailedSubject.send(statePolicy)
+    }
+
     func makeApproveInteractorState(from result: AllowanceState) -> ApproveInteractorState? {
         switch result {
         case .permissionRequired(let data):
@@ -195,6 +243,20 @@ private extension ApproveInteractor {
         }
 
         output?.approveDidSendTransaction()
+    }
+}
+
+// MARK: - Errors
+
+enum ApproveInteractorError: LocalizedError {
+    /// The selected policy and the built calldata diverged (recalculation in flight or failed).
+    case policyOutOfSync
+
+    var errorDescription: String? {
+        switch self {
+        case .policyOutOfSync:
+            return Localization.commonUnknownError
+        }
     }
 }
 

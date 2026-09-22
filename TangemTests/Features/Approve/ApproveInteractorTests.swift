@@ -151,6 +151,79 @@ struct ApproveInteractorTests {
         #expect(env.feeManager.updateFeesCalls == feesCallsBefore + 1, "The cancelled request must not trigger a fee update")
     }
 
+    @Test("Sending while the policy recalculation is still in flight throws and never dispatches the stale calldata")
+    func sendApproveTransaction_duringPolicyRecalculation_throwsAndDoesNotDispatch() async throws {
+        let unlimitedData = ApproveTransactionData(txData: Data([0xFF]), spender: testSpender, toContractAddress: testContractAddress)
+
+        let env = makeEnv()
+        env.allowanceService.setAllowanceStateResult(.success(.permissionRequired(unlimitedData)), for: ApprovePolicy.unlimited)
+        env.allowanceService.holdNextAllowanceStateCall()
+
+        let sut = makeSUT(env: env)
+        let recalculatingStates = OSAllocatedUnfairLock<[Bool]>(initialState: [])
+        let cancellable = sut.isRecalculatingPolicyPublisher.sink { value in
+            recalculatingStates.withLock { $0.append(value) }
+        }
+        defer { cancellable.cancel() }
+
+        // The user selects a new policy; the allowance round-trip is suspended inside the mock.
+        sut.updateApprovePolicy(policy: ApprovePolicy.unlimited)
+        try await waitUntil { env.allowanceService.allowanceStateCalls.count == 1 }
+        #expect(recalculatingStates.withLock { $0.last } == true, "The UI must be told the calldata is being rebuilt")
+
+        // A tap on Approve during that window must not sign the previous policy's calldata.
+        await #expect(throws: ApproveInteractorError.self) {
+            try await sut.sendApproveTransaction()
+        }
+        #expect(env.dispatcher.sendCalls.isEmpty, "Nothing may be dispatched while the policy and calldata diverge")
+
+        // Once the recalculation lands the send goes through with the NEW calldata.
+        let feesCallsBefore = env.feeManager.updateFeesCalls
+        env.allowanceService.releaseHeldAllowanceStateCalls()
+        try await waitUntil { env.feeManager.updateFeesCalls > feesCallsBefore }
+        #expect(recalculatingStates.withLock { $0.last } == false)
+
+        try await sut.sendApproveTransaction()
+
+        guard case .approve(let sentData, _) = env.dispatcher.sendCalls.first else {
+            Issue.record("Expected .approve transaction")
+            return
+        }
+        #expect(sentData.txData == unlimitedData.txData)
+    }
+
+    @Test("A failed policy recalculation reverts to the consistent policy and reports it, keeping the old calldata")
+    func updateApprovePolicy_recalculationFails_revertsAndReports() async throws {
+        let env = makeEnv()
+        env.allowanceService.allowanceStateResult = .failure(NSError(domain: "test", code: -1))
+
+        let sut = makeSUT(env: env) // initial policy is .specified
+        let originalTxData = sut.testApproveData.txData
+        let reportedPolicies = OSAllocatedUnfairLock<[ApprovePolicy]>(initialState: [])
+        let recalculatingStates = OSAllocatedUnfairLock<[Bool]>(initialState: [])
+        let failureCancellable = sut.policyRecalculationFailedPublisher.sink { policy in
+            reportedPolicies.withLock { $0.append(policy) }
+        }
+        let stateCancellable = sut.isRecalculatingPolicyPublisher.sink { value in
+            recalculatingStates.withLock { $0.append(value) }
+        }
+        defer {
+            failureCancellable.cancel()
+            stateCancellable.cancel()
+        }
+
+        sut.updateApprovePolicy(policy: ApprovePolicy.unlimited)
+        try await waitUntil { !reportedPolicies.withLock { $0.isEmpty } }
+
+        #expect(reportedPolicies.withLock { $0 } == [ApprovePolicy.specified], "The UI must be told which policy the calldata still matches")
+        #expect(recalculatingStates.withLock { $0.last } == false, "The recalculating flag must be cleared on failure")
+        #expect(sut.testApproveData.txData == originalTxData, "The previous calldata is kept")
+
+        // The interactor is consistent again (policy reverted), so a send is allowed and signs the OLD data.
+        try await sut.sendApproveTransaction()
+        #expect(env.analyticsLogger.logSwapButtonPermissionApproveCalls.first == ApprovePolicy.specified, "Analytics must reflect the policy actually signed")
+    }
+
     // MARK: - sendApproveTransaction
 
     @Test("Happy path: dispatches correct data and fee, marks sent, notifies output, logs analytics")

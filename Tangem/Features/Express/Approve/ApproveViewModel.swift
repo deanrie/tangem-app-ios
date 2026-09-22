@@ -39,6 +39,11 @@ final class ApproveViewModel: ObservableObject {
     private let interactor: ApproveInteractor
     private weak var coordinator: ApproveCoordinating?
 
+    /// Inputs to `mainButtonIsDisabled`: the fee state and whether the calldata is being rebuilt for a
+    /// newly selected policy. Either one alone must be enough to disable the button.
+    private var isFeeUnavailable = false
+    private var isRecalculatingPolicy = false
+
     private var bag: Set<AnyCancellable> = []
 
     init(input: Input) {
@@ -148,21 +153,49 @@ private extension ApproveViewModel {
                 viewModel.interactor.updateApprovePolicy(policy: policy)
             }
             .store(in: &bag)
+
+        // Keep the button disabled while the calldata is rebuilt for the newly selected policy, so a
+        // tap during the round-trip can't sign the previous policy's calldata.
+        interactor.isRecalculatingPolicyPublisher
+            .receiveOnMain()
+            .withWeakCaptureOf(self)
+            .sink { viewModel, isRecalculating in
+                viewModel.isRecalculatingPolicy = isRecalculating
+                viewModel.updateMainButtonAvailability()
+            }
+            .store(in: &bag)
+
+        // The calldata could not be rebuilt for the selection: revert the row to the policy that will
+        // actually be signed and tell the user, instead of showing one policy and signing another.
+        interactor.policyRecalculationFailedPublisher
+            .receiveOnMain()
+            .withWeakCaptureOf(self)
+            .sink { viewModel, consistentPolicy in
+                viewModel.selectedAction = consistentPolicy
+                viewModel.errorAlert = AlertBinder(title: Localization.commonError, message: Localization.commonUnknownError)
+            }
+            .store(in: &bag)
     }
 
     func updateView(tokenFee: TokenFee) {
         switch tokenFee.value {
         case .success:
             isLoading = false
-            mainButtonIsDisabled = false
+            isFeeUnavailable = false
         case .loading:
             isLoading = true
-            mainButtonIsDisabled = false
+            isFeeUnavailable = false
         case .failure(let error):
             errorAlert = AlertBinder(title: Localization.commonError, message: error.localizedDescription)
             isLoading = false
-            mainButtonIsDisabled = true
+            isFeeUnavailable = true
         }
+
+        updateMainButtonAvailability()
+    }
+
+    func updateMainButtonAvailability() {
+        mainButtonIsDisabled = isFeeUnavailable || isRecalculatingPolicy
     }
 
     func sendApproveTransaction() {
@@ -176,13 +209,13 @@ private extension ApproveViewModel {
                 await viewModel.didSendApproveTransaction()
             } catch TransactionDispatcherResult.Error.userCancelled {
                 await runOnMain {
-                    viewModel.mainButtonIsDisabled = false
+                    viewModel.updateMainButtonAvailability()
                     viewModel.isLoading = false
                 }
             } catch {
                 ExpressLogger.error(error: error)
                 await runOnMain {
-                    viewModel.mainButtonIsDisabled = false
+                    viewModel.updateMainButtonAvailability()
                     viewModel.isLoading = false
                     viewModel.errorAlert = .init(title: Localization.commonError, message: error.localizedDescription)
                 }
