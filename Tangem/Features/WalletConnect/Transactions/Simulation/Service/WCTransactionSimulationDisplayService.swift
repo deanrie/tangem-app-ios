@@ -74,21 +74,23 @@ struct WCTransactionSimulationDisplayService {
         walletModels: [any WalletModel],
         onApprovalEdit: ((ApprovalInfo, BlockaidChainScanResult.Asset) -> Void)?
     ) -> [WCTransactionSimulationDisplayModel.Section] {
+        var sections: [WCTransactionSimulationDisplayModel.Section] = []
+
         if let diff = result.assetsDiff, diff.in.isNotEmpty || diff.out.isNotEmpty {
-            return [.assetChanges(createAssetChangesSection(from: diff))]
+            sections.append(.assetChanges(createAssetChangesSection(from: diff)))
         }
 
         if let approvals = result.approvals, approvals.isNotEmpty {
-            return [.approvals(createApprovalsSection(
+            sections.append(.approvals(createApprovalsSection(
                 from: approvals,
                 originalTransaction: originalTransaction,
                 walletModels: walletModels,
                 onApprovalEdit: onApprovalEdit,
                 simulationResult: result
-            ))]
+            )))
         }
 
-        return [.noChanges]
+        return sections.isEmpty ? [.noChanges] : sections
     }
 
     private func createAssetChangesSection(
