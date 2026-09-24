@@ -10,6 +10,9 @@ import Foundation
 import TangemSdk
 
 class CreateMultiWalletTask: CardSessionRunnable {
+    /// Mirrors `CreateWalletTask.encryptionMode`: importing a key requires strong NFC encryption.
+    var encryptionMode: EncryptionMode { mnemonic == nil ? .none : .strong }
+
     private let curves: [EllipticCurve]
     private let mnemonic: Mnemonic?
     private let passphrase: String?

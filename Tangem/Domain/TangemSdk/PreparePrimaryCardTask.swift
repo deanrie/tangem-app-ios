@@ -17,6 +17,11 @@ class PreparePrimaryCardTask: CardSessionRunnable {
     /// Only the top-level runnable's `preflightReadMode` is applied, so the master secret must be loaded here.
     var preflightReadMode: PreflightReadMode { .fullCardRead(options: [.readMasterSecret]) }
 
+    /// Only the top-level runnable's `encryptionMode` is applied to the session, so the `.strong` mode
+    /// that `CreateWalletTask` requires for a key import must be declared here as well:
+    /// with a mnemonic, master private keys are sent to the card over NFC.
+    var encryptionMode: EncryptionMode { mnemonic == nil ? .none : .strong }
+
     private let curves: [EllipticCurve]
     private let shouldReset: Bool
     private let mnemonic: Mnemonic?
